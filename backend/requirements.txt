@@ -1,0 +1,14 @@
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+opencv-python-headless>=4.8.0   # Headless version for server (lighter)
+numpy>=1.24.0
+onnxruntime>=1.16.0
+scikit-learn>=1.3.0
+python-multipart>=0.0.6
+motor>=3.3.0
+pymongo>=4.6.0
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+websockets>=12.0
+geopy>=2.4.1
+
