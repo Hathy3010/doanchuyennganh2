@@ -17,6 +17,18 @@ classes_collection = db.classes
 attendance_collection = db.attendance
 documents_collection = db.documents
 
+# GPS Invalid Attendance Collections
+gps_invalid_attempts_collection = db.gps_invalid_attempts  # Track failed GPS attempts per student/class/day
+gps_invalid_audit_logs_collection = db.gps_invalid_audit_logs  # Audit logging for GPS-invalid attempts
+pending_notifications_collection = db.pending_notifications  # Store notifications for offline teachers
+
+# Document Sharing Collections
+highlights_collection = db.highlights  # Student highlights on documents
+notes_collection = db.notes  # Student personal notes on documents
+document_views_collection = db.document_views  # Track document views and reading positions
+session_reports_collection = db.session_reports  # Attendance session reports
+ai_explanations_collection = db.ai_explanations  # Saved AI explanations for highlights
+
 # Pydantic models for API
 class PyObjectId(ObjectId):
     @classmethod
@@ -199,3 +211,246 @@ class TeacherStatus(BaseModel):
 #   * Face detection/embedding should be async/background job if processing heavy.
 #   * Validate tokens and check authorization for teacher/student scope.
 #   * Ensure atomic updates for attendance (upsert by student_id+class_id+date).
+
+
+# ==========================================
+# DOCUMENT SHARING MODELS
+# ==========================================
+
+# Enhanced Document Model for sharing feature
+class DocumentShare(BaseModel):
+    """Document model for realtime sharing feature"""
+    id: Optional[PyObjectId] = Field(default_factory=PyObjectId, alias="_id")
+    class_id: PyObjectId
+    teacher_id: PyObjectId
+    title: str
+    description: Optional[str] = None
+    file_path: str  # Path to stored file
+    file_type: str  # pdf, docx, txt, md
+    file_size: int  # bytes
+    text_content: Optional[str] = None  # Extracted text for search/AI
+    upload_time: datetime = Field(default_factory=datetime.utcnow)
+    view_count: int = 0
+    unique_viewers: List[PyObjectId] = []
+    is_shared: bool = False  # Whether document has been shared with students
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+    class Config:
+        validate_by_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
+
+class DocumentShareCreate(BaseModel):
+    """Request model for creating a shared document"""
+    class_id: str
+    title: str
+    description: Optional[str] = None
+
+class DocumentShareResponse(BaseModel):
+    """Response model for document"""
+    id: str
+    class_id: str
+    teacher_id: str
+    title: str
+    description: Optional[str] = None
+    file_type: str
+    file_size: int
+    upload_time: str
+    view_count: int
+    is_shared: bool
+
+# Highlight Models
+class Highlight(BaseModel):
+    """Student highlight on a document"""
+    id: Optional[PyObjectId] = Field(default_factory=PyObjectId, alias="_id")
+    document_id: PyObjectId
+    student_id: PyObjectId  # Private to student
+    text_content: str
+    start_position: int
+    end_position: int
+    color: str = "yellow"  # yellow, green, blue, red
+    ai_explanation: Optional[dict] = None  # {content, generated_at, followup_questions}
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    class Config:
+        validate_by_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
+
+class HighlightCreate(BaseModel):
+    """Request model for creating a highlight"""
+    document_id: str
+    text_content: str
+    start_position: int
+    end_position: int
+    color: str = "yellow"
+
+class HighlightResponse(BaseModel):
+    """Response model for highlight"""
+    id: str
+    document_id: str
+    text_content: str
+    start_position: int
+    end_position: int
+    color: str
+    ai_explanation: Optional[dict] = None
+    created_at: str
+
+# Note Models
+class Note(BaseModel):
+    """Student personal note on a document"""
+    id: Optional[PyObjectId] = Field(default_factory=PyObjectId, alias="_id")
+    document_id: PyObjectId
+    student_id: PyObjectId  # Private to student
+    content: str  # max 1000 chars
+    position: int
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+    class Config:
+        validate_by_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
+
+class NoteCreate(BaseModel):
+    """Request model for creating a note"""
+    document_id: str
+    content: str = Field(..., max_length=1000)
+    position: int
+
+class NoteUpdate(BaseModel):
+    """Request model for updating a note"""
+    content: str = Field(..., max_length=1000)
+
+class NoteResponse(BaseModel):
+    """Response model for note"""
+    id: str
+    document_id: str
+    content: str
+    position: int
+    created_at: str
+    updated_at: str
+
+# Document View Models
+class DocumentView(BaseModel):
+    """Track document views and reading position"""
+    id: Optional[PyObjectId] = Field(default_factory=PyObjectId, alias="_id")
+    document_id: PyObjectId
+    student_id: PyObjectId
+    first_viewed_at: datetime = Field(default_factory=datetime.utcnow)
+    last_viewed_at: datetime = Field(default_factory=datetime.utcnow)
+    reading_position: int = 0  # For resume reading
+    time_spent_seconds: int = 0
+    view_count: int = 1
+
+    class Config:
+        validate_by_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
+
+# Session Report Models
+class SessionReport(BaseModel):
+    """Attendance session report"""
+    id: Optional[PyObjectId] = Field(default_factory=PyObjectId, alias="_id")
+    class_id: PyObjectId
+    date: str  # YYYY-MM-DD
+    total_students: int
+    present_count: int
+    absent_count: int
+    late_count: int
+    attendance_rate: float  # percentage
+    students: List[dict]  # [{student_id, student_name, status, check_in_time, gps_status, face_id_status, warnings}]
+    generated_at: datetime = Field(default_factory=datetime.utcnow)
+
+    class Config:
+        validate_by_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
+
+class SessionReportResponse(BaseModel):
+    """Response model for session report"""
+    id: str
+    class_id: str
+    date: str
+    total_students: int
+    present_count: int
+    absent_count: int
+    late_count: int
+    attendance_rate: float
+    students: List[dict]
+    generated_at: str
+
+# Semester Report Models
+class SemesterReportRequest(BaseModel):
+    """Request model for semester report"""
+    class_id: str
+    start_date: str  # YYYY-MM-DD
+    end_date: str  # YYYY-MM-DD
+
+class StudentAttendanceStats(BaseModel):
+    """Student attendance statistics"""
+    student_id: str
+    student_name: str
+    total_sessions: int
+    attended_sessions: int
+    missed_sessions: int
+    late_sessions: int
+    attendance_rate: float
+    is_at_risk: bool  # True if rate < 80%
+    remaining_absences: int
+
+class SemesterReportResponse(BaseModel):
+    """Response model for semester report"""
+    class_id: str
+    class_name: str
+    start_date: str
+    end_date: str
+    total_sessions: int
+    class_average_rate: float
+    students: List[StudentAttendanceStats]
+    at_risk_count: int
+
+# AI Explanation Models
+class AIExplanationRequest(BaseModel):
+    """Request model for AI explanation"""
+    highlight_id: str
+
+class AIFollowupRequest(BaseModel):
+    """Request model for AI follow-up question"""
+    highlight_id: str
+    question: str
+
+class AIExplanationResponse(BaseModel):
+    """Response model for AI explanation"""
+    highlight_id: str
+    explanation: str
+    generated_at: str
+    followup_questions: List[dict] = []
+
+# WebSocket Notification Models
+class DocumentNotification(BaseModel):
+    """WebSocket notification for new document"""
+    type: str = "document_shared"
+    document_id: str
+    title: str
+    teacher_name: str
+    class_name: str
+    timestamp: str
+
+class AttendanceWarningNotification(BaseModel):
+    """WebSocket notification for attendance warning"""
+    type: str = "attendance_warning"
+    class_id: str
+    class_name: str
+    attendance_rate: float
+    remaining_absences: int
+    message: str
+
+class SessionReportNotification(BaseModel):
+    """WebSocket notification for session report ready"""
+    type: str = "session_report_ready"
+    class_id: str
+    date: str
+    attendance_rate: float
+    timestamp: str

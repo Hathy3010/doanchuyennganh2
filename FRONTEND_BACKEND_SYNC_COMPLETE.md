@@ -42,17 +42,37 @@
   6. Xác minh embedding khuôn mặt (≥90%)
   7. Ghi nhận điểm danh
 
-### 2. Frontend - Sửa lỗi (frontend/app/(tabs)/student.tsx)
+### 2. Frontend - Cập nhật (frontend/app/(tabs)/student.tsx)
 
-#### Thêm hàm `testCamera`
-- Chụp ảnh test và gọi endpoint `/detect_face_pose_and_expression`
-- Hiển thị kết quả yaw/pitch
+#### Thay đổi `handleCheckIn`
+- Kiểm tra Face ID đã thiết lập trước khi điểm danh
+- Nếu chưa có Face ID → hiển thị alert yêu cầu thiết lập
+- Nếu có Face ID → mở modal RandomActionAttendanceModal để xác minh khuôn mặt
 
-#### Thêm styles còn thiếu
-- `setupFaceIDBanner` - Banner nhắc thiết lập Face ID
-- `setupBannerText`, `setupBannerDescription` - Text trong banner
-- `setupFaceIDButton`, `setupFaceIDButtonText` - Nút thiết lập
-- `testCameraButton`, `testCameraButtonDisabled`, `testCameraText` - Nút test camera
+#### Thêm hàm `handleSimpleCheckIn`
+- Điểm danh đơn giản chỉ với GPS (fallback/testing)
+
+### 3. Frontend - Cập nhật RandomActionAttendanceModal
+
+#### Cải tiến GPS
+- Sử dụng `expo-location` để lấy GPS thực từ thiết bị
+- Yêu cầu quyền location khi mở modal
+- Hiển thị tọa độ GPS trên UI
+
+#### Cải tiến UX
+- Thêm phase `init` để khởi tạo permissions
+- Hiển thị thông tin lớp học (tên, giờ, phòng)
+- Hiển thị số lần thử lại
+- Error messages rõ ràng hơn
+
+#### Flow điểm danh Face ID + GPS
+1. Mở modal → Yêu cầu quyền camera + location
+2. Lấy GPS từ thiết bị
+3. Hiển thị camera với hướng dẫn
+4. Chụp ảnh khuôn mặt
+5. Gửi lên server với GPS + ảnh
+6. Server xác minh: Liveness → Deepfake → GPS → Face Embedding
+7. Thành công → Ghi nhận điểm danh
 
 ## Mapping Endpoints Frontend → Backend
 
@@ -64,6 +84,57 @@
 | `POST /student/check-in` | `/student/check-in` | ✅ **MỚI THÊM** |
 | `POST /attendance/checkin` | `/attendance/checkin` | ✅ **MỚI THÊM** |
 | `POST /detect_face_pose_and_expression` | `/detect_face_pose_and_expression` | ✅ Có sẵn |
+
+## Flow điểm danh hoàn chỉnh
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    STUDENT DASHBOARD                         │
+├─────────────────────────────────────────────────────────────┤
+│  1. Kiểm tra Face ID đã thiết lập (GET /auth/me)            │
+│     └─ has_face_id: true/false                              │
+│                                                              │
+│  2. Nếu chưa có Face ID:                                    │
+│     └─ Hiển thị banner "Thiết lập Face ID"                  │
+│     └─ Click → Mở Face Setup Modal                          │
+│                                                              │
+│  3. Click "Điểm danh" trên lớp học:                         │
+│     └─ Nếu chưa có Face ID → Alert yêu cầu thiết lập        │
+│     └─ Nếu có Face ID → Mở RandomActionAttendanceModal      │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│              RANDOM ACTION ATTENDANCE MODAL                  │
+├─────────────────────────────────────────────────────────────┤
+│  Phase 1: INIT                                               │
+│  ├─ Yêu cầu quyền Camera                                    │
+│  ├─ Yêu cầu quyền Location                                  │
+│  └─ Lấy GPS từ thiết bị (expo-location)                     │
+│                                                              │
+│  Phase 2: SELECTING                                          │
+│  ├─ Hiển thị camera (front-facing)                          │
+│  ├─ Hiển thị thông tin lớp học                              │
+│  ├─ Hiển thị tọa độ GPS                                     │
+│  └─ Nút "Chụp ảnh"                                          │
+│                                                              │
+│  Phase 3: DETECTING                                          │
+│  └─ Chụp ảnh khuôn mặt                                      │
+│                                                              │
+│  Phase 4: ANTIFRAUD                                          │
+│  ├─ Gửi POST /attendance/checkin                            │
+│  │   └─ { class_id, latitude, longitude, image }            │
+│  ├─ Server xác minh:                                        │
+│  │   ├─ ✅ Liveness check                                   │
+│  │   ├─ ✅ Deepfake detection                               │
+│  │   ├─ ✅ GPS validation                                   │
+│  │   └─ ✅ Face embedding (≥90%)                            │
+│  └─ Hiển thị kết quả validation                             │
+│                                                              │
+│  Phase 5: RECORDING (Success)                                │
+│  └─ Hiển thị "Điểm danh thành công!"                        │
+└─────────────────────────────────────────────────────────────┘
+```
 
 ## Cách test
 
@@ -79,15 +150,18 @@
    npx expo start
    ```
 
-3. Chạy test script:
-   ```bash
-   py test_frontend_backend_sync.py
-   ```
+3. Test flow:
+   - Đăng nhập với tài khoản student
+   - Nếu chưa có Face ID → Thiết lập Face ID (15 frames)
+   - Click "Điểm danh" trên lớp học
+   - Chụp ảnh khuôn mặt
+   - Xác minh thành công → Điểm danh hoàn tất
 
 ## Lưu ý
 
 - Tất cả error messages đều bằng tiếng Việt
-- Face ID setup yêu cầu tối thiểu 10 ảnh (giảm từ 20 để UX tốt hơn)
+- Face ID setup yêu cầu tối thiểu 10 ảnh
 - Check-in yêu cầu Face ID đã được thiết lập
 - GPS validation sử dụng DEFAULT_LOCATION (có thể cấu hình)
 - Embedding similarity threshold: 90%
+- Cho phép retry 3 lần nếu xác minh thất bại

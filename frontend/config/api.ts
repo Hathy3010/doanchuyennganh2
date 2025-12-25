@@ -35,9 +35,9 @@ export const getApiUrl = (): string => {
   if (platform === 'ios') {
     // Try different IP addresses - change this to your machine's IP
     const possibleIPs = [
-      '192.168.1.8',  // Current detected IP
+      '192.168.1.24',  // Current detected IP
+      '192.168.1.8',   // Previous IP
       '192.168.1.100', // Common alternative
-      '10.0.0.100',    // Another common range
     ];
 
     // Use the first working IP or default to detected one
@@ -73,12 +73,21 @@ export const API_URL = (() => {
   return url;
 })();
 
+// WebSocket URL (derived from API_URL)
+export const WS_URL = (() => {
+  const apiUrl = getApiUrl();
+  // Replace http with ws
+  const wsUrl = apiUrl.replace('http://', 'ws://').replace('https://', 'wss://');
+  console.log(`🔌 Final WS_URL: ${wsUrl}`);
+  return wsUrl;
+})();
+
 // Alternative configurations for manual override
 export const API_CONFIGS = {
   localhost: 'http://localhost:8002',
   android: 'http://10.0.2.2:8002',
   ios_localhost: 'http://localhost:8002',
-  ios_network: 'http://192.168.1.8:8002', // Detected IP for iOS
+  ios_network: 'http://192.168.1.24:8002', // Detected IP for iOS
   production: 'https://your-production-api.com'
 };
 

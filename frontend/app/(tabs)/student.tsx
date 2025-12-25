@@ -138,8 +138,11 @@ export default function StudentDashboard() {
         });
         if (profileResponse.ok) {
           const profile = await profileResponse.json();
+          // Only log when Face ID status changes
+          if (profile.has_face_id !== hasFaceIDSetup) {
+            console.log(`✅ Face ID setup status changed: ${profile.has_face_id}`);
+          }
           setHasFaceIDSetup(profile.has_face_id);
-          console.log(`✅ Face ID setup status: ${profile.has_face_id}`);
         }
       } catch (error) {
         console.warn("Could not load profile:", error);
@@ -482,6 +485,26 @@ const handlePoseDetectedCapture = useCallback(async (forceCapture = false) => {
   };
 
   const handleCheckIn = async (classItem: ScheduleItem) => {
+    // Check if Face ID is set up first
+    if (!hasFaceIDSetup) {
+      Alert.alert(
+        "Chưa thiết lập Face ID",
+        "Bạn cần thiết lập Face ID trước khi điểm danh. Bạn có muốn thiết lập ngay không?",
+        [
+          { text: "Hủy", style: "cancel" },
+          { text: "Thiết lập", onPress: handleSetupFaceID }
+        ]
+      );
+      return;
+    }
+
+    // Open Face ID verification modal for attendance
+    setCurrentClassItem(classItem);
+    setShowRandomActionModal(true);
+  };
+
+  // Simple check-in without face verification (for testing/fallback)
+  const handleSimpleCheckIn = async (classItem: ScheduleItem) => {
     try {
       const token = await AsyncStorage.getItem("access_token");
       if (!token) {
@@ -489,9 +512,9 @@ const handlePoseDetectedCapture = useCallback(async (forceCapture = false) => {
         return;
       }
 
-      // Get GPS location (using default for now)
-      const latitude = 10.762622;
-      const longitude = 106.660172;
+      // Get GPS location (using VKU default for now)
+      const latitude = 16.0544;
+      const longitude = 108.2022;
 
       // Call check-in API
       const response = await fetch(`${API_URL}/student/check-in`, {

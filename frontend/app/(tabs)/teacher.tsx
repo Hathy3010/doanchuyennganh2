@@ -52,15 +52,21 @@ export default function TeacherDashboard() {
   const [currentUser, setCurrentUser] = useState<any>(null);
   const router = useRouter();
   const wsRef = useRef<WebSocket | null>(null);
+  const reconnectDelayRef = useRef<number>(5000); // Start with 5 seconds
 
   // WebSocket connection for real-time updates
   const connectWebSocket = (teacherId: string) => {
     try {
-      const wsUrl = `ws://localhost:8001/ws/teacher/${teacherId}`;
+      // Extract host from API_URL and use port 8002 for WebSocket
+      const apiHost = API_URL.replace('http://', '').replace('https://', '').split(':')[0];
+      const wsUrl = `ws://${apiHost}:8002/ws/teacher/${teacherId}`;
+      console.log('🔌 Connecting WebSocket:', wsUrl);
       const ws = new WebSocket(wsUrl);
 
       ws.onopen = () => {
         console.log('WebSocket connected for teacher:', teacherId);
+        // Reset reconnect delay on successful connection
+        reconnectDelayRef.current = 5000;
       };
 
       ws.onmessage = (event) => {
@@ -68,7 +74,7 @@ export default function TeacherDashboard() {
           const data = JSON.parse(event.data);
           console.log('Received WebSocket message:', data);
 
-          if (data.type === 'attendance_update') {
+          if (data.type === 'attendance_update' || data.type === 'gps_invalid_attendance') {
             handleAttendanceUpdate(data);
           }
         } catch (error) {
@@ -82,12 +88,15 @@ export default function TeacherDashboard() {
 
       ws.onclose = () => {
         console.log('WebSocket disconnected');
-        // Auto reconnect after 5 seconds
+        // Exponential backoff: double delay on each failure, max 60 seconds
+        const delay = reconnectDelayRef.current;
+        reconnectDelayRef.current = Math.min(delay * 2, 60000);
+        console.log(`🔄 Reconnecting in ${delay / 1000}s...`);
         setTimeout(() => {
           if (currentUser) {
-            connectWebSocket(currentUser._id);
+            connectWebSocket(currentUser._id || currentUser.id);
           }
-        }, 5000);
+        }, delay);
       };
 
       wsRef.current = ws;
@@ -103,6 +112,21 @@ export default function TeacherDashboard() {
     // Add to recent notifications
     setRecentNotifications(prev => [notification, ...prev.slice(0, 9)]); // Keep last 10
 
+    // Handle GPS-invalid notification type
+    if (notification.type === 'gps_invalid_attendance') {
+      // Show GPS-invalid specific alert
+      Alert.alert(
+        "⚠️ GPS Không Hợp Lệ",
+        `${notification.student_name} (${notification.class_name})\n` +
+        `📍 Khoảng cách: ${notification.gps_distance || 0}m\n` +
+        `✅ Face ID: Hợp lệ\n` +
+        `❌ GPS: Không hợp lệ`,
+        [{ text: "OK" }],
+        { cancelable: true }
+      );
+      return;
+    }
+
     // Update attendance summary for the class
     setAttendanceSummary(prev =>
       prev.map(summary => {
@@ -117,10 +141,23 @@ export default function TeacherDashboard() {
       })
     );
 
+    // Build validation details message
+    let detailsMsg = '';
+    if (notification.validation_details) {
+      const face = notification.validation_details.face;
+      const gps = notification.validation_details.gps;
+      if (face?.similarity_score) {
+        detailsMsg += `\n🔐 Face ID: ${(face.similarity_score * 100).toFixed(0)}%`;
+      }
+      if (gps?.distance_meters !== undefined) {
+        detailsMsg += `\n📍 GPS: ${gps.distance_meters}m`;
+      }
+    }
+
     // Show toast notification
     Alert.alert(
-      "Điểm danh mới",
-      `${notification.student_name}: ${notification.message}`,
+      "✅ Điểm danh mới",
+      `${notification.student_name}: ${notification.message}${detailsMsg}`,
       [{ text: "OK" }],
       { cancelable: true }
     );
@@ -211,8 +248,8 @@ export default function TeacherDashboard() {
 
   // Setup WebSocket when we have user info
   useEffect(() => {
-    if (currentUser && currentUser._id) {
-      connectWebSocket(currentUser._id);
+    if (currentUser && (currentUser._id || currentUser.id)) {
+      connectWebSocket(currentUser._id || currentUser.id);
     }
 
     return () => {
@@ -257,24 +294,48 @@ export default function TeacherDashboard() {
       {recentNotifications.length > 0 && (
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Thông báo gần đây</Text>
-          {recentNotifications.slice(0, 3).map((notification, index) => (
-            <View key={index} style={[
-              styles.notificationCard,
-              notification.has_warnings && styles.notificationWarning
-            ]}>
-              <Text style={styles.notificationText}>
-                {notification.student_name} - {notification.class_name}
-              </Text>
-              <Text style={styles.notificationTime}>
-                {new Date(notification.check_in_time).toLocaleTimeString('vi-VN')}
-              </Text>
-              {notification.warnings && notification.warnings.length > 0 && (
-                <Text style={styles.warningText}>
-                  ⚠️ {notification.warnings.join(', ')}
+          {recentNotifications.slice(0, 3).map((notification, index) => {
+            const isGpsInvalid = notification.type === 'gps_invalid_attendance';
+            return (
+              <View key={index} style={[
+                styles.notificationCard,
+                notification.has_warnings && styles.notificationWarning,
+                isGpsInvalid && styles.notificationGpsInvalid
+              ]}>
+                <View style={styles.notificationHeader}>
+                  <Text style={styles.notificationText}>
+                    {notification.student_name} - {notification.class_name}
+                  </Text>
+                  {isGpsInvalid && (
+                    <View style={styles.gpsInvalidBadge}>
+                      <Text style={styles.gpsInvalidBadgeText}>GPS ❌</Text>
+                    </View>
+                  )}
+                </View>
+                <Text style={styles.notificationTime}>
+                  {new Date(notification.check_in_time || notification.timestamp).toLocaleTimeString('vi-VN')}
                 </Text>
-              )}
-            </View>
-          ))}
+                {isGpsInvalid && (
+                  <View style={styles.gpsInvalidDetails}>
+                    <Text style={styles.gpsInvalidDetailText}>
+                      📍 Khoảng cách: {notification.distance_meters || 0}m
+                    </Text>
+                    <Text style={styles.gpsInvalidDetailText}>
+                      ✅ Face ID hợp lệ | ❌ GPS không hợp lệ
+                    </Text>
+                    <Text style={styles.gpsInvalidAttemptText}>
+                      Lần thử: {notification.attempt_number || 0}/2
+                    </Text>
+                  </View>
+                )}
+                {notification.warnings && notification.warnings.length > 0 && (
+                  <Text style={styles.warningText}>
+                    ⚠️ {notification.warnings.join(', ')}
+                  </Text>
+                )}
+              </View>
+            );
+          })}
         </View>
       )}
 
@@ -552,5 +613,75 @@ const styles = StyleSheet.create({
     color: "#FF9800",
     fontWeight: "500",
     marginTop: 4,
+  },
+  // GPS Invalid Notification Styles
+  notificationGpsInvalid: {
+    borderLeftColor: "#FF3B30",
+    backgroundColor: "#FFF5F5",
+  },
+  notificationHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 4,
+  },
+  gpsInvalidBadge: {
+    backgroundColor: "#FF3B30",
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 4,
+  },
+  gpsInvalidBadgeText: {
+    color: "#FFFFFF",
+    fontSize: 11,
+    fontWeight: "bold",
+  },
+  gpsInvalidDetails: {
+    backgroundColor: "#FFE5E5",
+    padding: 8,
+    borderRadius: 6,
+    marginTop: 8,
+  },
+  gpsInvalidDetailText: {
+    fontSize: 13,
+    color: "#333",
+    marginBottom: 2,
+  },
+  gpsInvalidAttemptText: {
+    fontSize: 13,
+    color: "#FF9500",
+    fontWeight: "600",
+    marginTop: 4,
+  },
+  // Notifications section styles
+  notificationsSection: {
+    marginTop: 20,
+    backgroundColor: "white",
+    borderRadius: 10,
+    padding: 15,
+  },
+  notificationsTitle: {
+    fontSize: 18,
+    fontWeight: "bold",
+    color: "#333",
+    marginBottom: 10,
+  },
+  notificationItem: {
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: "#f0f0f0",
+  },
+  studentName: {
+    fontWeight: "bold",
+    color: "#333",
+  },
+  statusText: {
+    fontSize: 14,
+  },
+  statusSuccess: {
+    color: "#34C759",
+  },
+  statusError: {
+    color: "#FF3B30",
   },
 });
