@@ -26,7 +26,7 @@ export const getApiUrl = (): string => {
 
   // Android Emulator - special IP to access host machine
   if (platform === 'android') {
-    const url = 'http://10.0.2.2:8001';
+    const url = 'http://10.0.2.2:8002';
     console.log(`📱 Android: Using ${url}`);
     return url;
   }
@@ -35,14 +35,14 @@ export const getApiUrl = (): string => {
   if (platform === 'ios') {
     // Try different IP addresses - change this to your machine's IP
     const possibleIPs = [
-      '192.168.1.18',  // Current detected IP
+      '192.168.1.8',  // Current detected IP
       '192.168.1.100', // Common alternative
       '10.0.0.100',    // Another common range
     ];
 
     // Use the first working IP or default to detected one
     const networkIP = possibleIPs[0]; // Change index to try different IPs
-    const networkUrl = `http://${networkIP}:8001`;
+    const networkUrl = `http://${networkIP}:8002`;
 
     console.log(`🍎 iOS: Using network IP ${networkUrl}`);
     console.log(`💡 iOS: If this IP doesn't work:`);
@@ -55,13 +55,13 @@ export const getApiUrl = (): string => {
 
   // Web browser - localhost
   if (platform === 'web') {
-    const url = 'http://localhost:8001';
+    const url = 'http://localhost:8002';
     console.log(`🌐 Web: Using ${url}`);
     return url;
   }
 
   // Default fallback
-  const url = 'http://localhost:8001';
+  const url = 'http://localhost:8002';
   console.log(`❓ Unknown platform: Using ${url}`);
   return url;
 };
@@ -75,10 +75,10 @@ export const API_URL = (() => {
 
 // Alternative configurations for manual override
 export const API_CONFIGS = {
-  localhost: 'http://localhost:8001',
-  android: 'http://10.0.2.2:8001',
-  ios_localhost: 'http://localhost:8001',
-  ios_network: 'http://192.168.1.18:8001', // Detected IP for iOS
+  localhost: 'http://localhost:8002',
+  android: 'http://10.0.2.2:8002',
+  ios_localhost: 'http://localhost:8002',
+  ios_network: 'http://192.168.1.8:8002', // Detected IP for iOS
   production: 'https://your-production-api.com'
 };
 

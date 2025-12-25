@@ -29,6 +29,7 @@ def is_ready(session_id):
 
 def clear(session_id):
     FRAME_BUFFER.pop(session_id, None)
+
 def movement_score(frames):
     diffs = []
     for i in range(len(frames) - 1):

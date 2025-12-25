@@ -1,6 +1,6 @@
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
-opencv-python-headless>=4.8.0   # Headless version for server (lighter)
+opencv-contrib-python-headless>=4.8.0 # Contrib version is required for the face module (FacemarkLBF)
 numpy>=1.24.0
 onnxruntime>=1.16.0
 scikit-learn>=1.3.0

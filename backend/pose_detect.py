@@ -1,580 +1,452 @@
-# pose_detect.py - Face Pose Detection Module
+# pose_detect.py - Face Pose Detection Module (Enhanced)
 import cv2
 import numpy as np
 import logging
 import os
-from typing import Optional, Tuple
+import base64
+import io
+from typing import Optional, Tuple, Union
+from face_detect import detect_face, estimate_face_pose_pnp
 
 logger = logging.getLogger(__name__)
-_landmark_detector = None
-
-# ===== FACIAL LANDMARK DETECTION =====
-LANDMARK_MODEL_PATH = "models/lbfmodel.yaml"
-
-# 3D face model (approximate coordinates for key facial points)
-# Based on standard face model
-FACE_3D_MODEL = np.array([
-    [0.0, 0.0, 0.0],          # Nose tip
-    [-30.0, -125.0, -30.0],   # Left eye left corner
-    [30.0, -125.0, -30.0],    # Right eye right corner
-    [-60.0, 50.0, -30.0],     # Left mouth corner
-    [60.0, 50.0, -30.0],      # Right mouth corner
-    [0.0, 100.0, -30.0],      # Chin
-], dtype=np.float32)
-
-# Camera matrix (approximate for mobile camera)
-CAMERA_MATRIX = np.array([
-    [600.0, 0.0, 320.0],    # fx, 0, cx
-    [0.0, 600.0, 240.0],    # 0, fy, cy
-    [0.0, 0.0, 1.0]         # 0, 0, 1
-], dtype=np.float32)
-
-DIST_COEFFS = np.zeros((4, 1))  # No lens distortion
 
 # ===== POSE DETECTION CONSTANTS =====
-HORIZONTAL_THRESHOLD = 0.35  # 35% from center for horizontal detection (more tolerant)
-VERTICAL_THRESHOLD = 0.30    # 30% from center for vertical detection (more tolerant)
-ASPECT_RATIO_THRESHOLD = 0.15  # For tilted faces
-MIN_FACE_SIZE = (30, 30)     # Minimum face size for detection (reduced for mobile)
-MIN_FACE_SIZE_STRICT = (50, 50)  # Stricter size for pose analysis
+MIN_FACE_SIZE = (50, 50)     # Minimum face size for detection
 
 # ===== FACIAL LANDMARK DETECTION =====
 LANDMARK_MODEL_PATH = "models/lbfmodel.yaml"
 
-def _ensure_landmark_detector():
-    global _landmark_detector
+# Global facemark instance để tránh load model nhiều lần
+_facemark_instance = None
 
-    if _landmark_detector is not None:
-        return _landmark_detector
+def get_facemark_instance():
+    """Get or create global facemark instance (singleton pattern)"""
+    global _facemark_instance
+    if _facemark_instance is None:
+        logger.info(f"Loading LBF landmark model from {LANDMARK_MODEL_PATH}")
+        _facemark_instance = cv2.face.createFacemarkLBF()
+        _facemark_instance.loadModel(LANDMARK_MODEL_PATH)
+        logger.info("LBF landmark model loaded successfully")
+    return _facemark_instance
 
-    if not os.path.exists(LANDMARK_MODEL_PATH):
-        logger.warning(f"Landmark model not found at {LANDMARK_MODEL_PATH}")
+# 3D face model points (approximate) tương ứng với 2D landmarks
+FACE_3D_MODEL = np.array([
+    [0.0, 0.0, 0.0],       # Nose tip
+    [0.0, -63.6, -12.5],   # Chin
+    [-43.3, 32.7, -26.0],  # Left eye left corner
+    [43.3, 32.7, -26.0],   # Right eye right corner
+    [-28.9, -28.9, -24.1], # Left mouth corner
+    [28.9, -28.9, -24.1]   # Right mouth corner
+], dtype=np.float32)
+
+# Camera matrix giả định 640x480
+# Note: Mobile cameras often have different orientations
+CAMERA_MATRIX = np.array([
+    [640, 0, 320],
+    [0, 640, 240],
+    [0, 0, 1]
+], dtype=np.float32)
+
+# Alternative camera matrix for flipped orientation
+CAMERA_MATRIX_FLIPPED = np.array([
+    [640, 0, 320],
+    [0, -640, 240],  # Negative fy for vertical flip
+    [0, 0, 1]
+], dtype=np.float32)
+
+DIST_COEFFS = np.zeros((4, 1))  # Không có distortion
+
+
+def _ensure_image(image_or_b64: Union[np.ndarray, str, bytes]) -> Optional[np.ndarray]:
+    """Ensure the input is an OpenCV BGR image. Accepts base64 str/bytes, file path, or ndarray.
+    Handles 180° rotated camera images (common on mobile)."""
+    if image_or_b64 is None:
+        logger.warning("_ensure_image: input is None")
         return None
+    
+    # If already an ndarray, return as-is
+    if isinstance(image_or_b64, np.ndarray):
+        logger.debug(f"_ensure_image: already ndarray, shape={image_or_b64.shape}")
+        return image_or_b64
 
+    # If string or bytes, try to decode as base64 or load from path
     try:
-        detector = cv2.face.createFacemarkLBF()
-        detector.loadModel(LANDMARK_MODEL_PATH)
-        _landmark_detector = detector
-        logger.info("Facial landmark detector loaded ONCE")
-        return _landmark_detector
+        # If a string, it might be a base64 string or a filesystem path
+        if isinstance(image_or_b64, str):
+            logger.debug(f"_ensure_image: input is string (length={len(image_or_b64)})")
+            # Try base64 first
+            try:
+                image_or_b64 = base64.b64decode(image_or_b64)
+                logger.debug(f"✅ Successfully decoded base64 to {len(image_or_b64)} bytes")
+            except Exception as b64_err:
+                logger.warning(f"⚠️ Base64 decode failed: {b64_err}, trying file path...")
+                # Not base64 -> try to load file path
+                img_from_path = cv2.imread(image_or_b64)
+                if img_from_path is not None:
+                    logger.info(f"✅ Loaded image from file path: {image_or_b64.shape}")
+                    return img_from_path
+                logger.error(f"❌ Neither base64 nor valid file path: {image_or_b64}")
+                return None
+
+        # image_or_b64 is now bytes
+        logger.debug(f"_ensure_image: decoding {len(image_or_b64)} bytes")
+        nparr = np.frombuffer(image_or_b64, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        if img is None:
+            logger.error("❌ cv2.imdecode returned None - corrupted image data")
+            return None
+        
+        logger.info(f"✅ Image decoded successfully: shape={img.shape}")
+        return img
+        
     except Exception as e:
-        logger.warning(f"Could not load landmark detector: {e}")
+        logger.error(f"❌ _ensure_image exception: {e}", exc_info=True)
         return None
 
 
-def detect_facial_landmarks(image: np.ndarray, face_rect: tuple) -> Optional[np.ndarray]:
+def classify_pose_from_angles(pitch: float, yaw: float, roll: float = 0, expected_pose: str = "") -> str:
     """
-    Detect facial landmarks for pose estimation
-    Returns 68 facial landmarks if successful
+    Xác định pose từ pitch/yaw/roll, đồng bộ với frontend logic
+    Sử dụng roll để phân biệt left/right khi yaw nhỏ
     """
-    landmark_detector = _ensure_landmark_detector()
-    if landmark_detector is None:
-        return None
+    # Check most specific conditions first
+    if pitch > 4:  # Giảm từ 20° xuống 3-5°
+        return "up"
+    elif pitch < -4:  # Giảm từ -20° xuống -3 đến -5°
+        return "down"
+    elif 2 <= yaw <= 45:  # Left: từ 2° đến 45°
+        return "left"
+    elif -45 <= yaw <= -2:  # Right: từ -45° đến -2°
+        return "right"
+    elif abs(yaw) < 4 and abs(pitch) < 10:  # Khi yaw nhỏ (dưới ngưỡng), dùng roll để phân biệt
+        # Roll positive = face tilted right, negative = face tilted left
+        if abs(roll) > 3:  # Chỉ dùng roll khi có sự nghiêng rõ ràng
+            if roll > 3:
+                return "left"   # Mặt xoay sang trái
+            elif roll < -3:
+                return "right"  # Mặt xoay sang phải
+        # Nếu roll cũng nhỏ, coi là front
+        return "front"
+    elif abs(yaw) < 15 and abs(pitch) < 10:  # Front condition phù hợp với ngưỡng mới
+        return "front"
+    return "unknown"
 
+
+def get_landmarks(image_or_b64, face_rect):
+    """Lấy landmarks 2D từ face_rect sử dụng global facemark instance"""
+    img = _ensure_image(image_or_b64)
+    if img is None or face_rect is None:
+        return None
+    x, y, w, h = face_rect
     try:
-        # Convert face rect to format expected by facemark
-        faces = [face_rect]  # (x, y, w, h)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    except Exception:
+        return None
+    facemark = get_facemark_instance()
 
-        # Detect landmarks
-        ok, landmarks = landmark_detector.fit(image, faces)
-
-        if ok and len(landmarks) > 0:
-            # landmarks[0] contains the 68 points for first face
-            landmark_points = landmarks[0][0]  # Shape: (68, 2)
-            logger.debug(f"Detected {len(landmark_points)} facial landmarks")
-            return landmark_points
-
-    except Exception as e:
-        logger.debug(f"Landmark detection failed: {e}")
-
+    ok, landmarks = facemark.fit(gray, np.array([face_rect]))
+    if ok:
+        return landmarks[0][0]  # (68,2)
     return None
 
-def estimate_face_pose_simple(image: np.ndarray, face_rect: tuple) -> Optional[dict]:
+
+def detect_face_pose_and_angle(image: Union[np.ndarray, str, bytes]) -> Tuple[str, dict]:
     """
-    Simple face pose estimation using eye detection and basic geometry
-    This is a simplified version that doesn't require facial landmarks
+    Detect face pose and return both pose classification and angle information.
+    Accepts a numpy image or a base64 string/bytes.
+    Handles 180° rotated camera images by automatically rotating if needed.
+    Returns: (pose_string, angle_info_dict)
     """
+    img = _ensure_image(image)
+    if img is None or img.size == 0:
+        logger.error("❌ detect_face_pose_and_angle: _ensure_image returned None or empty")
+        return "no_face", {}
+
     try:
-        x, y, w, h = face_rect
+        height, width = img.shape[:2]
+        logger.debug(f"🔍 Processing image for pose+angle: {width}x{height}")
 
-        # Extract face region
-        face_roi = image[y:y+h, x:x+w]
-        if face_roi.size == 0:
-            return None
+        # ===== Detect face (Cascade Classifier) with optimization =====
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Enhance contrast for better face detection
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray_enhanced = clahe.apply(gray)
+        
+        cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        
+        # Try multiple parameter sets (lenient to strict)
+        face_detection_params = [
+            {"scaleFactor": 1.05, "minNeighbors": 2, "flags": cv2.CASCADE_SCALE_IMAGE},  # Lenient
+            {"scaleFactor": 1.1, "minNeighbors": 3},  # Medium
+            {"scaleFactor": 1.2, "minNeighbors": 4},  # Stricter
+        ]
+        
+        faces = None
+        for params in face_detection_params:
+            logger.debug(f"🔍 Trying cascade with params: {params}")
+            faces = cascade.detectMultiScale(gray_enhanced, **params, minSize=MIN_FACE_SIZE)
+            
+            if faces is not None and len(faces) > 0:
+                logger.info(f"✅ Cascade detector found {len(faces)} faces with params: {params}")
+                break
+        
+        logger.info(f"📊 Cascade detector result: {len(faces) if faces is not None else 0} faces")
 
-        # Convert to grayscale
-        gray_face = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
+        # If no faces found, try with 180° rotated image (mobile camera orientation)
+        if faces is None or len(faces) == 0:
+            logger.info("⚠️ No faces detected, trying 180° rotation...")
+            img_rotated = cv2.rotate(img, cv2.ROTATE_180)
+            gray_rotated = cv2.cvtColor(img_rotated, cv2.COLOR_BGR2GRAY)
+            gray_rotated_enhanced = clahe.apply(gray_rotated)
+            
+            for params in face_detection_params:
+                faces = cascade.detectMultiScale(gray_rotated_enhanced, **params, minSize=MIN_FACE_SIZE)
+                if faces is not None and len(faces) > 0:
+                    logger.info(f"✅ Face found after 180° rotation! ({len(faces)} faces)")
+                    img = img_rotated
+                    gray = gray_rotated
+                    break
+            else:
+                logger.info("⚠️ Still no faces after rotation, trying DNN detector...")
 
-        # Detect eyes using Haar cascades
-        eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
-        eyes = eye_cascade.detectMultiScale(gray_face, 1.1, 3, minSize=(20, 20))
+        if faces is None or len(faces) == 0:
+            # Fallback DNN
+            logger.info("🔄 Trying DNN face detector...")
+            face_crop = detect_face(img)
+            if face_crop is not None:
+                logger.info("✅ DNN face detection succeeded")
+                return "front", {"yaw": 0, "pitch": 0, "roll": 0, "landmarks": None}
+            
+            # Last resort: try simple face detection on resized image
+            logger.info("⚠️ Trying face detection on resized image...")
+            img_small = cv2.resize(img, (320, 240))
+            gray_small = cv2.cvtColor(img_small, cv2.COLOR_BGR2GRAY)
+            faces_small = cascade.detectMultiScale(gray_small, scaleFactor=1.1, minNeighbors=2, minSize=(30, 30))
+            
+            if faces_small is not None and len(faces_small) > 0:
+                logger.info(f"✅ Face detected in resized image!")
+                return "front", {"yaw": 0, "pitch": 0, "roll": 0, "landmarks": None}
+            
+            logger.error("❌ All face detectors failed - no face found")
+            return "no_face", {}
 
-        if len(eyes) < 2:
-            logger.debug("Could not detect both eyes for pose estimation")
-            return None
+        # Lấy face lớn nhất
+        x, y, w, h = sorted(faces, key=lambda f: f[2]*f[3], reverse=True)[0]
+        face_rect = (x, y, w, h)
 
-        # Sort eyes by x position (left to right)
-        eyes = sorted(eyes, key=lambda e: e[0])
+        # ===== Get landmarks =====
+        landmarks_all = get_landmarks(img, face_rect)
+        logger.debug(f"Landmarks detection: got {len(landmarks_all) if landmarks_all is not None else 0} landmarks")
+        if landmarks_all is None or len(landmarks_all) < 68:
+            logger.warning("Không đủ landmarks để tính pose")
+            return "unknown", {"yaw": 0, "pitch": 0, "roll": 0, "landmarks": None}
 
-        # Take the two most prominent eyes
-        if len(eyes) >= 2:
-            left_eye = eyes[0]
-            right_eye = eyes[1]
+        # ===== Estimate pose using PnP =====
+        # Select key landmarks for pose estimation (same as original)
+        landmarks = landmarks_all[[30, 8, 36, 45, 48, 54]]  # nose, chin, eyes, mouth corners
 
-            # Calculate eye centers in face coordinates
-            left_eye_center = (left_eye[0] + left_eye[2]//2, left_eye[1] + left_eye[3]//2)
-            right_eye_center = (right_eye[0] + right_eye[2]//2, right_eye[1] + right_eye[3]//2)
+        if len(landmarks) < 6:
+            logger.warning("Không đủ landmarks key để tính pose")
+            return "unknown", {"yaw": 0, "pitch": 0, "roll": 0, "landmarks": landmarks_all}
 
-            # Convert to image coordinates
-            left_eye_center_img = (x + left_eye_center[0], y + left_eye_center[1])
-            right_eye_center_img = (x + right_eye_center[0], y + right_eye_center[1])
+        # Solve PnP with primary camera matrix
+        success, rotation_vector, translation_vector = cv2.solvePnP(
+            FACE_3D_MODEL.astype(np.float32),
+            landmarks.astype(np.float32),
+            CAMERA_MATRIX,
+            DIST_COEFFS,
+            flags=cv2.SOLVEPNP_ITERATIVE
+        )
 
-            # Calculate basic pose angles from eye positions
-            # This is a simplified approach
-            eye_distance = np.sqrt((right_eye_center_img[0] - left_eye_center_img[0])**2 +
-                                 (right_eye_center_img[1] - left_eye_center_img[1])**2)
+        logger.debug(f"PnP solve (normal): success={success}")
 
-            # Calculate horizontal offset (yaw indication)
-            face_center_x = x + w/2
-            eyes_center_x = (left_eye_center_img[0] + right_eye_center_img[0]) / 2
-            horizontal_offset = (eyes_center_x - face_center_x) / (w / 2)
+        # If PnP fails, try with flipped camera matrix (for mobile camera orientation issues)
+        if not success:
+            logger.debug("Trying with flipped camera matrix...")
+            success, rotation_vector, translation_vector = cv2.solvePnP(
+                FACE_3D_MODEL.astype(np.float32),
+                landmarks.astype(np.float32),
+                CAMERA_MATRIX_FLIPPED,
+                DIST_COEFFS,
+                flags=cv2.SOLVEPNP_ITERATIVE
+            )
+            logger.debug(f"PnP solve (flipped): success={success}")
 
-            # Calculate vertical offset (pitch indication)
-            face_center_y = y + h/2
-            eyes_center_y = (left_eye_center_img[1] + right_eye_center_img[1]) / 2
-            vertical_offset = (eyes_center_y - face_center_y) / (h / 2)
+        if not success:
+            logger.warning("PnP solve failed with both camera matrices")
+            return "unknown", {"yaw": 0, "pitch": 0, "roll": 0, "landmarks": landmarks_all}
 
-            # Estimate angles (sensitive to small movements)
-            yaw_estimate = np.degrees(np.arcsin(horizontal_offset * 0.8))  # Max ~50 degrees, sensitive
-            pitch_estimate = np.degrees(np.arcsin(vertical_offset * 0.6))  # Max ~35 degrees, sensitive
+        # Convert rotation vector to Euler angles
+        rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
+        yaw = np.arctan2(rotation_matrix[2, 0], rotation_matrix[2, 2]) * 180 / np.pi
+        pitch = np.arctan2(-rotation_matrix[2, 1], np.sqrt(rotation_matrix[0, 1]**2 + rotation_matrix[1, 1]**2)) * 180 / np.pi
+        roll = np.arctan2(rotation_matrix[1, 0], rotation_matrix[0, 0]) * 180 / np.pi
 
-            # Fix camera orientation for eye-based method too
-            yaw_estimate = -yaw_estimate
+        # Debug logging
+        logger.debug(f"Raw angles - yaw: {yaw:.1f}°, pitch: {pitch:.1f}°, roll: {roll:.1f}°")
 
-            logger.debug(".3f")
+        # Handle camera orientation issues (mobile cameras often flip)
+        # If angles are completely inverted (yaw ~180°), flip them
+        if abs(yaw) > 150:
+            logger.warning(f"Camera orientation issue detected (yaw: {yaw:.1f}°), flipping angles")
+            yaw = yaw - np.sign(yaw) * 180  # Flip 180 degrees
+            pitch = -pitch  # Also flip pitch
+            roll = -roll    # And roll
 
-            return {
-                'yaw': yaw_estimate,
-                'pitch': pitch_estimate,
-                'roll': 0.0,  # Cannot estimate roll from eyes alone
-                'eye_distance': eye_distance,
-                'method': 'eye_based'
-            }
+        # Additional check: if pitch is also inverted, double-flip
+        if abs(pitch) > 80:
+            logger.warning(f"Extreme pitch detected ({pitch:.1f}°), possible double-flip needed")
+            pitch = np.clip(pitch - np.sign(pitch) * 180, -90, 90)
+
+        # Final clamping to reasonable ranges
+        yaw = np.clip(yaw, -90, 90)      # Face can't realistically turn more than 90°
+        pitch = np.clip(pitch, -45, 45)  # Face tilt is limited
+        roll = np.clip(roll, -30, 30)    # Face roll is minimal
+
+        logger.debug(f"Final angles - yaw: {yaw:.1f}°, pitch: {pitch:.1f}°, roll: {roll:.1f}°")
+
+        # Classify pose based on angles
+        pose = classify_pose_from_angles(pitch, yaw, roll)
+        logger.debug(f"Pose classification: yaw={yaw:.1f}°, pitch={pitch:.1f}°, roll={roll:.1f}° -> pose='{pose}'")
+
+        angle_info = {
+            "yaw": float(yaw),
+            "pitch": float(pitch),
+            "roll": float(roll),
+            "landmarks": landmarks_all.tolist() if landmarks_all is not None else None
+        }
+
+        return pose, angle_info
 
     except Exception as e:
-        logger.debug(f"Simple pose estimation failed: {e}")
-
-    return None
-
-def estimate_face_pose_pnp(image: np.ndarray, face_rect: tuple) -> Optional[dict]:
-    """
-    Estimate face pose using PnP algorithm with facial landmarks
-    Falls back to simple eye-based method if landmarks unavailable
-    """
-    # Try landmark-based PnP first
-    landmarks_2d = detect_facial_landmarks(image, face_rect)
-    if landmarks_2d is not None:
-        try:
-            # Select key landmarks for PnP (nose tip, eye corners, mouth corners, chin)
-            # Using standard landmark indices
-            key_indices = [30, 36, 45, 48, 54, 8]  # Nose, eyes, mouth, chin
-
-            if len(landmarks_2d) >= max(key_indices) + 1:
-                # Extract 2D points
-                points_2d = landmarks_2d[key_indices].astype(np.float32)
-
-                # Solve PnP
-                success, rotation_vector, translation_vector = cv2.solvePnP(
-                    FACE_3D_MODEL, points_2d, CAMERA_MATRIX, DIST_COEFFS,
-                    flags=cv2.SOLVEPNP_ITERATIVE
-                )
-
-                if success:
-                    # Convert rotation vector to Euler angles
-                    rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
-
-                    # Extract Euler angles (pitch, yaw, roll)
-                    pitch = np.arctan2(rotation_matrix[2, 1], rotation_matrix[2, 2])
-                    yaw = np.arctan2(-rotation_matrix[2, 0],
-                                    np.sqrt(rotation_matrix[2, 1]**2 + rotation_matrix[2, 2]**2))
-                    roll = np.arctan2(rotation_matrix[1, 0], rotation_matrix[0, 0])
-
-            # Convert to degrees
-            pitch_deg = np.degrees(pitch)
-            yaw_deg = np.degrees(yaw)
-            roll_deg = np.degrees(roll)
-
-            # Fix camera orientation - flip yaw for correct left/right detection
-            yaw_deg = -yaw_deg
-
-            logger.debug(".1f")
-
-            return {
-                        'rotation_vector': rotation_vector,
-                        'translation_vector': translation_vector,
-                        'pitch': pitch_deg,
-                        'yaw': yaw_deg,
-                        'roll': roll_deg,
-                        'rotation_matrix': rotation_matrix,
-                        'method': 'landmark_pnp'
-                    }
-
-        except Exception as e:
-            logger.debug(f"Landmark PnP failed: {e}")
-
-    # Fallback to simple eye-based pose estimation
-    logger.debug("Using eye-based pose estimation fallback")
-    return estimate_face_pose_simple(image, face_rect)
-
-def classify_pose_from_angles(
-    pitch: float,
-    yaw: float,
-    roll: float = 0.0,
-    expected_pose: Optional[str] = None,
-    mode: str = "liveness"
-) -> str:
-
-    # ===== 1️⃣ APPLE-STYLE THRESHOLDS - NATURAL MOVEMENT =====
-    # Wide acceptance ranges like Apple Face ID - natural head movement
-
-    # Define ranges based on mode
-    if mode == "setup":
-        # Generous ranges for natural circular motion
-        LEFT_RANGE = (-80, -5)      # Wide left acceptance
-        RIGHT_RANGE = (5, 80)       # Wide right acceptance
-        UP_RANGE = (-70, -10)       # Wide up acceptance
-        DOWN_RANGE = (10, 70)       # Wide down acceptance
-        FRONT_TOLERANCE = 25        # Front accepts ±25° from center
-        ROLL_THRESHOLD = 25         # Allow more head tilt
-    else:  # liveness mode - still generous but more defined
-        LEFT_RANGE = (-70, -15)
-        RIGHT_RANGE = (15, 70)
-        UP_RANGE = (-60, -20)
-        DOWN_RANGE = (20, 60)
-        FRONT_TOLERANCE = 20
-
-    # Normalize expected_pose
-    expected = expected_pose.lower() if expected_pose else ""
-
-    # ===== 2️⃣ APPLE-STYLE NATURAL POSE DETECTION =====
-    # Expected-pose aware with generous ranges for natural movement
-
-    if "left" in expected:
-        if LEFT_RANGE[0] <= yaw <= LEFT_RANGE[1]:
-            return "left"
-        # If not in left range, could be front (within tolerance)
-        if abs(yaw) <= FRONT_TOLERANCE and abs(pitch) <= FRONT_TOLERANCE:
-            return "front"
-        return "left"  # Default to left if expected
-
-    if "right" in expected:
-        if RIGHT_RANGE[0] <= yaw <= RIGHT_RANGE[1]:
-            return "right"
-        # If not in right range, could be front (within tolerance)
-        if abs(yaw) <= FRONT_TOLERANCE and abs(pitch) <= FRONT_TOLERANCE:
-            return "front"
-        return "right"  # Default to right if expected
-
-    if "up" in expected:
-        if UP_RANGE[0] <= pitch <= UP_RANGE[1]:
-            return "up"
-        # If not in up range, could be front (within tolerance)
-        if abs(yaw) <= FRONT_TOLERANCE and abs(pitch) <= FRONT_TOLERANCE:
-            return "front"
-        return "up"  # Default to up if expected
-
-    if "down" in expected:
-        if DOWN_RANGE[0] <= pitch <= DOWN_RANGE[1]:
-            return "down"
-        # If not in down range, could be front (within tolerance)
-        if abs(yaw) <= FRONT_TOLERANCE and abs(pitch) <= FRONT_TOLERANCE:
-            return "front"
-        return "down"  # Default to down if expected
-
-    # ===== 3️⃣ NATURAL CLASSIFICATION - APPLE STYLE =====
-    # Best-fit classification for natural head movement
-
-    # Calculate confidence scores for each pose
-    scores = {
-        "front": 0,
-        "left": 0,
-        "right": 0,
-        "up": 0,
-        "down": 0
-    }
-
-    # Front scoring - prefer when both yaw and pitch are small
-    if abs(yaw) <= FRONT_TOLERANCE and abs(pitch) <= FRONT_TOLERANCE:
-        scores["front"] = 100 - (abs(yaw) + abs(pitch))  # Higher score for more centered
-
-    # Left scoring - based on yaw in left range
-    if LEFT_RANGE[0] <= yaw <= LEFT_RANGE[1]:
-        scores["left"] = 80 + (abs(yaw) - abs(LEFT_RANGE[0])) * 0.5  # Closer to center = higher score
-
-    # Right scoring - based on yaw in right range
-    if RIGHT_RANGE[0] <= yaw <= RIGHT_RANGE[1]:
-        scores["right"] = 80 + (abs(yaw) - abs(RIGHT_RANGE[0])) * 0.5
-
-    # Up scoring - based on pitch in up range
-    if UP_RANGE[0] <= pitch <= UP_RANGE[1]:
-        scores["up"] = 80 + (abs(pitch) - abs(UP_RANGE[0])) * 0.5
-
-    # Down scoring - based on pitch in down range
-    if DOWN_RANGE[0] <= pitch <= DOWN_RANGE[1]:
-        scores["down"] = 80 + (abs(pitch) - abs(DOWN_RANGE[0])) * 0.5
-
-    # Handle roll (head tilt) - reduce front score if tilted too much
-    if abs(roll) > ROLL_THRESHOLD:
-        scores["front"] *= 0.7  # Reduce front confidence if head is tilted
-
-    # Return pose with highest score
-    best_pose = max(scores, key=scores.get)
-    best_score = scores[best_pose]
-
-    # Only return directional pose if confidence is reasonable
-    if best_score >= 60:  # Minimum confidence threshold
-        return best_pose
-
-    return "front"  # Default to front if no pose has good confidence
+        logger.error(f"Error in detect_face_pose_and_angle: {e}")
+        return "error", {"yaw": 0, "pitch": 0, "roll": 0, "landmarks": None}
 
 
 def detect_face_pose(
-    image: np.ndarray,
+    image: Union[np.ndarray, str, bytes],
     expected_pose: Optional[str] = None,
     mode: str = "setup"
 ) -> str:
-
     """
-    Detect hướng khuôn mặt using PnP algorithm with facial landmarks
-
-    Args:
-        image: RGB/BGR image array
-
-    Returns:
-        str: Pose type - "front", "left", "right", "up", "down", "tilted_front", "no_face", "unknown"
+    Detect face pose using PnP, chỉ trả về các pose chính xác.
+    Nếu mode=="setup" thì yêu cầu left → right (cho FaceID setup)
     """
-    if image is None or image.size == 0:
+    img = _ensure_image(image)
+    if img is None or img.size == 0:
         return "no_face"
 
     try:
-        # Log image info for debugging
-        height, width = image.shape[:2]
+        height, width = img.shape[:2]
         logger.debug(f"Processing image: {width}x{height}")
 
-        # Load face detector
-        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-
-        # Convert to grayscale
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-        # Try multiple detection parameters and cascades for robustness
-        faces = None
-
-        # Try different Haar cascades for better mobile detection
-        cascade_files = [
-            'haarcascade_frontalface_default.xml',
-            'haarcascade_frontalface_alt.xml',
-            'haarcascade_frontalface_alt2.xml',
-            'haarcascade_profileface.xml'  # For side faces
-        ]
-
-        for cascade_file in cascade_files:
-            cascade_path = cv2.data.haarcascades + cascade_file
-            if os.path.exists(cascade_path):
-                temp_cascade = cv2.CascadeClassifier(cascade_path)
-
-                # Try multiple scales and parameters
-                scales_and_params = [
-                    (1.1, 3, MIN_FACE_SIZE),      # Standard
-                    (1.2, 2, (20, 20)),           # More liberal
-                    (1.05, 4, MIN_FACE_SIZE),     # Conservative
-                ]
-
-                for scale, min_neighbors, min_size in scales_and_params:
-                    temp_faces = temp_cascade.detectMultiScale(gray, scale, min_neighbors, minSize=min_size)
-                    if temp_faces is not None and len(temp_faces) > 0:
-                        if faces is None or len(temp_faces) > len(faces):
-                            faces = temp_faces
-                            logger.debug(f"Found {len(faces)} faces with {cascade_file} (scale={scale}, min_neighbors={min_neighbors})")
-                        break
-
-                if faces is not None and len(faces) > 0:
-                    break
-
-        # If still no faces, try with image preprocessing
-        if faces is None or len(faces) == 0:
-            # Apply histogram equalization to improve contrast
-            gray_eq = cv2.equalizeHist(gray)
-            faces = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml').detectMultiScale(
-                gray_eq, 1.1, 2, minSize=(20, 20))
-            logger.debug(f"Enhanced detection found {len(faces) if faces is not None else 0} faces")
+        # ===== Detect face =====
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        faces = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml") \
+                    .detectMultiScale(gray, scaleFactor=1.1, minNeighbors=3, minSize=MIN_FACE_SIZE)
 
         if faces is None or len(faces) == 0:
-            # Try DNN face detection as fallback
-            try:
-                from backend.face_detect import detect_face
-                face_img = detect_face(image)
-                if face_img is not None:
-                    logger.debug("DNN face detection succeeded as fallback")
-                    # For DNN fallback, assume front pose since we can't determine pose from single detection
-                    return "front"
-            except ImportError:
-                logger.debug("DNN face detection not available")
-            except Exception as e:
-                logger.debug(f"DNN face detection failed: {e}")
-
-            logger.debug("No faces detected with any method")
+            # Fallback DNN
+            face_crop = detect_face(img)
+            if face_crop is not None:
+                logger.debug("DNN face detection succeeded, assume front pose")
+                return "front"
             return "no_face"
 
-        # Lấy face đầu tiên (largest)
-        faces = sorted(faces, key=lambda x: x[2] * x[3], reverse=True)
-        x, y, w, h = faces[0]
+        # Lấy face lớn nhất
+        x, y, w, h = sorted(faces, key=lambda f: f[2]*f[3], reverse=True)[0]
         face_rect = (x, y, w, h)
 
-        logger.debug(f"Selected face: x={x}, y={y}, w={w}, h={h}")
+        # ===== Get landmarks =====
+        landmarks_all = get_landmarks(img, face_rect)
+        if landmarks_all is None or len(landmarks_all) < 68:
+            logger.warning("Không đủ landmarks để tính pose")
+            return "unknown"
 
-        # Try PnP-based pose estimation first
-        pose_result = estimate_face_pose_pnp(image, face_rect)
-        if pose_result is not None:
-            pose = classify_pose_from_angles(
-                pose_result["pitch"],
-                pose_result["yaw"],
-                pose_result["roll"],
-                expected_pose=expected_pose,
-                mode=mode
-            )
+        landmarks_2d = np.array([
+            landmarks_all[30],  # Nose tip
+            landmarks_all[8],   # Chin
+            landmarks_all[36],  # Left eye left corner
+            landmarks_all[45],  # Right eye right corner
+            landmarks_all[48],  # Left mouth corner
+            landmarks_all[54],  # Right mouth corner
+        ], dtype=np.float32)
 
-
-            logger.debug(f"PnP pose detection: {pose}")
+        # ===== SolvePnP =====
+        try:
+            rvec, tvec = estimate_face_pose_pnp(landmarks_2d, FACE_3D_MODEL, CAMERA_MATRIX, DIST_COEFFS)
+            pitch, yaw, roll = rotation_vector_to_euler(rvec)
+            pose = classify_pose_from_angles(pitch, yaw, roll, expected_pose or "")
+            logger.debug(f"PnP pose detected: {pose}")
             return pose
-
-        # Fallback to zone-based detection if PnP fails
-        logger.debug("PnP failed, using zone-based fallback")
-
-        # Tính tỷ lệ khung hình
-        # Tính center của khuôn mặt
-        face_center_x = x + w/2
-        face_center_y = y + h/2
-
-        # Tính center của camera frame
-        frame_center_x = width / 2
-        frame_center_y = height / 2
-
-        # Tính offset từ center (normalized)
-        offset_x = (face_center_x - frame_center_x) / (width / 2)  # -1 to 1
-        offset_y = (face_center_y - frame_center_y) / (height / 2)  # -1 to 1
-
-        # Tính aspect ratio để detect tilted faces
-        aspect_ratio = w / h
-
-        # Debug logging
-        logger.debug(f"Zone-based: center=({face_center_x:.1f}, {face_center_y:.1f}), offsets: x={offset_x:.3f}, y={offset_y:.3f}")
-
-        # Zone-based pose detection - more tolerant for setup
-        center_zone_x = 0.3  # ±30% from center horizontally (tolerant for setup)
-        center_zone_y = 0.3  # ±30% from center vertically (tolerant for setup)
-            # ===== EXPECTED-POSE AWARE DIRECTION THRESHOLD =====
-        if mode == "setup" and expected_pose in ["left", "right"]:
-            directional_threshold = 0.12   # 👈 nhạy hơn cho setup FaceID
-        else:
-            directional_threshold = 0.4    # 👈 bình thường
-
-        
-        # More tolerant zone detection for setup
-        # Only consider "front" if face is within tolerance zone
-        if abs(offset_x) < center_zone_x and abs(offset_y) < center_zone_y:
-            if 0.8 < aspect_ratio < 1.2:  # Tolerant aspect ratio for front
-                logger.debug(".3f")
-                return "front"
-            else:
-                logger.debug("Zone-based: tilted_front")
-                return "tilted_front"
-
-        # For setup, be more forgiving with directional classification
-        # Require significant movement to classify as directional
-        if abs(offset_x) > directional_threshold:  # Need >40% movement
-            if offset_x < 0:
-                logger.debug(".3f")
-                return "left"
-            else:
-                logger.debug(".3f")
-                return "right"
-        elif abs(offset_y) > directional_threshold:  # Need >40% movement
-            if offset_y < 0:
-                logger.debug(".3f")
-                return "up"
-            else:
-                logger.debug(".3f")
-                return "down"
-
-        # If movement not significant enough, default to front
-        logger.debug(".3f")
-        return "front"
+        except Exception as e:
+            logger.error(f"PnP pose estimation failed: {e}")
+            return "unknown"
 
     except Exception as e:
-        logger.error(f"Error in pose detection: {e}")
+        logger.error(f"Error in detect_face_pose: {e}")
         return "unknown"
 
-def validate_pose_against_expected(image: np.ndarray, expected_pose: str) -> Tuple[bool, str]:
-    
-    # Normalize expected_pose FIRST
+
+# ========== PHẦN GIỮ NGUYÊN ==========
+
+def rotation_vector_to_euler(rvec: np.ndarray) -> tuple:
+    R, _ = cv2.Rodrigues(rvec)
+    sy = np.sqrt(R[0,0]**2 + R[1,0]**2)
+    singular = sy < 1e-6
+    if not singular:
+        x = np.arctan2(R[2,1], R[2,2])
+        y = np.arctan2(-R[2,0], sy)
+        z = np.arctan2(R[1,0], R[0,0])
+    else:
+        x = np.arctan2(-R[1,2], R[1,1])
+        y = np.arctan2(-R[2,0], sy)
+        z = 0
+    pitch = np.degrees(x)
+    yaw = np.degrees(y)
+    roll = np.degrees(z)
+    return pitch, yaw, roll
+
+
+def _normalize_pose_string(expected_pose: str) -> str:
+    if not expected_pose:
+        return ""
     expected_lower = expected_pose.lower()
     if "front" in expected_lower:
-        expected_normalized = "front"
-    elif "left" in expected_lower:
-        expected_normalized = "left"
-    elif "right" in expected_lower:
-        expected_normalized = "right"
-    elif "up" in expected_lower:
-        expected_normalized = "up"
-    elif "down" in expected_lower:
-        expected_normalized = "down"
-    else:
-        expected_normalized = expected_lower
-    
+        return "front"
+    if "left" in expected_lower:
+        return "left"
+    if "right" in expected_lower:
+        return "right"
+    if "up" in expected_lower:
+        return "up"
+    if "down" in expected_lower:
+        return "down"
+    return expected_lower
+
+
+def validate_pose_against_expected(image: Union[np.ndarray, str, bytes], expected_pose: str) -> Tuple[bool, str]:
+    expected_normalized = _normalize_pose_string(expected_pose)
+
     detected_pose = detect_face_pose(
-    image,
-    expected_pose=expected_normalized,
-    mode="setup"
-)
+        image,
+        expected_pose=expected_normalized,
+        mode="setup"
+    )
 
-
-    # Normalize expected_pose to lowercase and extract base pose
-    expected_lower = expected_pose.lower()
-    if "front" in expected_lower:
-        expected_normalized = "front"
-    elif "left" in expected_lower:
-        expected_normalized = "left"
-    elif "right" in expected_lower:
-        expected_normalized = "right"
-    elif "up" in expected_lower:
-        expected_normalized = "up"
-    elif "down" in expected_lower:
-        expected_normalized = "down"
-    else:
-        expected_normalized = expected_lower
-
-    # Debug logging
     logger.debug(f"Pose validation: expected='{expected_pose}' -> normalized='{expected_normalized}', detected='{detected_pose}'")
 
-    # Case-insensitive comparison
     if detected_pose == expected_normalized:
-        logger.debug(f"Pose validation: ✅ MATCH")
+        logger.debug("Pose validation: ✅ MATCH")
         return True, detected_pose
     else:
         logger.debug(f"Pose validation: ❌ MISMATCH - Expected {expected_normalized}, got {detected_pose}")
         return False, detected_pose
 
+
 def get_pose_requirements(expected_pose: str) -> dict:
-    """
-    Get requirements and instructions for a specific pose
-
-    Args:
-        expected_pose: Pose to get requirements for ("Front", "Left 45°", "Right 45°", "Up", "Down")
-
-    Returns:
-        dict: Requirements and instructions
-    """
     requirements = {
         "front": {
             "instruction": "Hướng mặt về phía trước, nhìn thẳng vào camera",
@@ -603,7 +475,6 @@ def get_pose_requirements(expected_pose: str) -> dict:
         }
     }
 
-    # Normalize expected_pose to match requirements keys
     expected_lower = expected_pose.lower()
     if "front" in expected_lower:
         normalized_key = "front"
@@ -624,131 +495,276 @@ def get_pose_requirements(expected_pose: str) -> dict:
         "description": "Unknown pose"
     })
 
-def calibrate_pose_thresholds(test_image: np.ndarray) -> dict:
+# ===== FACIAL EXPRESSION DETECTION (Enterprise Face ID) =====
+
+def detect_facial_expression(detection_result: dict, expression_id: str) -> bool:
     """
-    Calibrate pose detection thresholds based on a test image
+    Detect specific facial expressions for enterprise Face ID anti-spoofing
 
     Args:
-        test_image: Image to use for calibration
+        detection_result: Result from detect_face_pose_and_angle
+        expression_id: Type of expression to detect ("blink", "mouth_open", "smile")
 
     Returns:
-        dict: Calibration results and recommendations
+        bool: True if expression detected
     """
     try:
-        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-        gray = cv2.cvtColor(test_image, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.1, 4, minSize=MIN_FACE_SIZE)
+        landmarks = detection_result.get("landmarks", [])
+        if not landmarks or len(landmarks) < 68:
+            logger.warning("Not enough landmarks for expression detection")
+            return False
 
-        if len(faces) == 0:
-            return {"error": "No face detected in calibration image"}
+        # Convert landmarks to numpy array
+        landmarks = np.array(landmarks, dtype=np.float32)
 
-        x, y, w, h = faces[0]
-        height, width = test_image.shape[:2]
-
-        face_center_x = x + w/2
-        face_center_y = y + h/2
-        frame_center_x = width / 2
-        frame_center_y = height / 2
-
-        offset_x = (face_center_x - frame_center_x) / (width / 2)
-        offset_y = (face_center_y - frame_center_y) / (height / 2)
-        aspect_ratio = w / h
-
-        return {
-            "face_center": (face_center_x, face_center_y),
-            "frame_center": (frame_center_x, frame_center_y),
-            "offset_x": offset_x,
-            "offset_y": offset_y,
-            "aspect_ratio": aspect_ratio,
-            "face_size": (w, h),
-            "recommended_thresholds": {
-                "horizontal": abs(offset_x) * 1.5,
-                "vertical": abs(offset_y) * 1.5
-            }
-        }
+        if expression_id == "blink":
+            return detect_blink_expression(landmarks)
+        elif expression_id == "mouth_open":
+            return detect_mouth_open_expression(landmarks)
+        elif expression_id == "smile":
+            return detect_smile_expression(landmarks)
+        else:
+            logger.warning(f"Unknown expression type: {expression_id}")
+            return False
 
     except Exception as e:
-        return {"error": f"Calibration failed: {e}"}
+        logger.error(f"Error detecting facial expression {expression_id}: {e}")
+        return False
 
-
-def detect_face_pose_and_angle(image: np.ndarray) -> Tuple[str, dict]:
+def detect_blink_expression(landmarks: np.ndarray) -> bool:
     """
-    Detect face pose and return both classification and raw angles (Face ID style)
+    Detect eye blink by calculating Eye Aspect Ratio (EAR)
+    EAR < threshold indicates blink
+    """
+    try:
+        # Left eye landmarks (points 36-41)
+        left_eye = landmarks[36:42]
+        # Right eye landmarks (points 42-47)
+        right_eye = landmarks[42:48]
+
+        # Calculate EAR for left eye
+        left_ear = calculate_eye_aspect_ratio(left_eye)
+        # Calculate EAR for right eye
+        right_ear = calculate_eye_aspect_ratio(right_eye)
+
+        # Average EAR
+        avg_ear = (left_ear + right_ear) / 2.0
+
+        # Blink threshold - more lenient for better detection
+        BLINK_THRESHOLD = 0.2
+
+        logger.info(f"Blink detection - Left EAR: {left_ear:.3f}, Right EAR: {right_ear:.3f}, Avg: {avg_ear:.3f}, Threshold: {BLINK_THRESHOLD}")
+
+        return avg_ear < BLINK_THRESHOLD
+
+    except Exception as e:
+        logger.error(f"Error in blink detection: {e}")
+        return False
+
+def calculate_eye_aspect_ratio(eye_landmarks: np.ndarray) -> float:
+    """Calculate Eye Aspect Ratio (EAR) for blink detection"""
+    try:
+        # Vertical eye landmarks
+        # eye[0] = left corner, eye[3] = right corner
+        # eye[1] = top, eye[5] = bottom
+        vertical1 = np.linalg.norm(eye_landmarks[1] - eye_landmarks[5])
+        vertical2 = np.linalg.norm(eye_landmarks[2] - eye_landmarks[4])
+
+        # Horizontal eye landmark
+        horizontal = np.linalg.norm(eye_landmarks[0] - eye_landmarks[3])
+
+        # EAR formula
+        ear = (vertical1 + vertical2) / (2.0 * horizontal)
+        return ear
+
+    except Exception as e:
+        logger.error(f"Error calculating EAR: {e}")
+        return 1.0  # Return high value (eyes open)
+
+def detect_mouth_open_expression(landmarks: np.ndarray) -> bool:
+    """
+    Detect mouth opening by calculating Mouth Aspect Ratio (MAR)
+    MAR > threshold indicates mouth open
+    """
+    try:
+        # Mouth landmarks (points 48-67)
+        mouth = landmarks[48:68]
+
+        # Vertical distances (outer mouth)
+        vertical_outer = np.linalg.norm(mouth[2] - mouth[10])  # Top to bottom outer
+        vertical_inner = np.linalg.norm(mouth[3] - mouth[9])   # Top to bottom inner
+
+        # Average vertical
+        vertical = (vertical_outer + vertical_inner) / 2.0
+
+        # Horizontal distance (mouth width)
+        horizontal = np.linalg.norm(mouth[0] - mouth[6])  # Left to right corner
+
+        # MAR (Mouth Aspect Ratio)
+        mar = vertical / horizontal if horizontal > 0 else 0
+
+        # Mouth open threshold - more lenient for better detection
+        MOUTH_OPEN_THRESHOLD = 0.35
+
+        logger.info(f"Mouth open detection - MAR: {mar:.3f} (threshold: {MOUTH_OPEN_THRESHOLD})")
+
+        return mar > MOUTH_OPEN_THRESHOLD
+
+    except Exception as e:
+        logger.error(f"Error in mouth open detection: {e}")
+        return False
+
+
+    
+
+def detect_smile_expression(landmarks: np.ndarray) -> bool:
+    """
+    Detect smile by analyzing mouth corner positions and lip curve
+    Smile indicators: mouth corners up, lip curve changes
+    """
+    try:
+        # Mouth landmarks (points 48-67)
+        mouth = landmarks[48:68]
+
+        # Mouth corners
+        left_corner = mouth[0]   # Point 48
+        right_corner = mouth[6]  # Point 54
+
+        # Upper lip center points
+        upper_lip_left = mouth[2]    # Point 50
+        upper_lip_center = mouth[3]  # Point 51
+        upper_lip_right = mouth[4]   # Point 52
+
+        # Calculate mouth corner elevation (smile indicator)
+        # Compare y-coordinates (lower values = higher position)
+        corner_elevation = (left_corner[1] + right_corner[1]) / 2.0
+        lip_center_y = upper_lip_center[1]
+
+        # Mouth width for normalization
+        mouth_width = np.linalg.norm(left_corner - right_corner)
+
+        # Normalized elevation difference
+        elevation_diff = (lip_center_y - corner_elevation) / mouth_width
+
+        # Smile threshold (corners higher than center indicates smile)
+        SMILE_THRESHOLD = 0.05  # Adjust based on testing
+
+        logger.info(f"Smile detection - Elevation diff: {elevation_diff:.3f} (threshold: {SMILE_THRESHOLD})")
+
+        return elevation_diff > SMILE_THRESHOLD
+
+    except Exception as e:
+        logger.error(f"Error in smile detection: {e}")
+        return False
+
+
+# ------------------------
+# Wrapper for frontend student actions
+# ------------------------
+def detect_face_pose_and_expression(image: Union[np.ndarray, str, bytes], action_id: str) -> dict:
+    """
+    Unified detection function for frontend student flow.
 
     Args:
-        image: RGB/BGR image array
+        image: ndarray or base64/file bytes
+        action_id: one of 'neutral','blink','mouth_open','micro_movement','final_neutral','smile'
 
     Returns:
-        Tuple[str, dict]: (pose_type, angle_info)
-        angle_info contains: yaw, pitch, roll, landmarks (if available)
+        dict with keys: face_present, yaw, pitch, roll, message, expression_detected (bool), captured (bool), action (str or None), landmarks
     """
-    if image is None or image.size == 0:
-        return "no_face", {"yaw": 0, "pitch": 0, "roll": 0}
-
     try:
-        # Use existing face detection logic but return angles instead of pose classification
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
-
-        # Try multiple face detection methods (robustness)
-        faces = []
-        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-        faces = face_cascade.detectMultiScale(gray, 1.1, 4, minSize=(30, 30))
-
-        if len(faces) == 0:
-            # Try profile face detection
-            profile_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_profileface.xml')
-            faces = profile_cascade.detectMultiScale(gray, 1.1, 4, minSize=(30, 30))
-
-        if len(faces) == 0:
-            return "no_face", {"yaw": 0, "pitch": 0, "roll": 0}
-
-        # Take the largest face
-        face = max(faces, key=lambda f: f[2] * f[3])
-        x, y, w, h = face
-
-        # Extract face region
-        face_roi = image[y:y+h, x:x+w]
-
-        # Try to get landmarks and calculate angles using PnP
-        try:
-            # Use landmark detection for pose estimation
-            landmarks = get_facial_landmarks(face_roi)
-
-            if landmarks is not None and len(landmarks) >= 68:
-                # Calculate pose angles using solvePnP
-                pose_result = estimate_pose_from_landmarks(landmarks, (w, h))
-
-                if pose_result:
-                    return "face_detected", {
-                        "yaw": float(pose_result["yaw"]),
-                        "pitch": float(pose_result["pitch"]),
-                        "roll": float(pose_result["roll"]),
-                        "landmarks": landmarks.tolist() if hasattr(landmarks, 'tolist') else landmarks
-                    }
-        except Exception as e:
-            pass  # Fall back to basic estimation
-
-        # Fallback: Basic angle estimation from face position in frame
-        height, width = image.shape[:2]
-        face_center_x = x + w/2
-        face_center_y = y + h/2
-        frame_center_x = width / 2
-        frame_center_y = height / 2
-
-        # Estimate angles based on face position (rough approximation)
-        yaw_offset = (face_center_x - frame_center_x) / (width / 2)
-        pitch_offset = (face_center_y - frame_center_y) / (height / 2)
-
-        # Convert to approximate angles (this is not accurate but provides diversity data)
-        estimated_yaw = yaw_offset * 30  # Max ~30 degrees
-        estimated_pitch = pitch_offset * 20  # Max ~20 degrees
-
-        return "face_detected", {
-            "yaw": float(estimated_yaw),
-            "pitch": float(estimated_pitch),
-            "roll": 0.0,
+        pose, angle_info = detect_face_pose_and_angle(image)
+    except Exception as e:
+        logger.error(f"detect_face_pose_and_expression: failed to run angle detection: {e}")
+        return {
+            "face_present": False,
+            "yaw": 0,
+            "pitch": 0,
+            "roll": 0,
+            "message": "Error processing image",
+            "expression_detected": False,
+            "captured": False,
+            "action": None,
             "landmarks": None
         }
 
-    except Exception as e:
-        return "no_face", {"yaw": 0, "pitch": 0, "roll": 0}
+    face_present = pose not in ["no_face", "error"]
+    yaw = float(angle_info.get("yaw", 0))
+    pitch = float(angle_info.get("pitch", 0))
+    roll = float(angle_info.get("roll", 0))
+    landmarks = angle_info.get("landmarks")
+
+    result = {
+        "face_present": face_present,
+        "yaw": yaw,
+        "pitch": pitch,
+        "roll": roll,
+        "message": "",
+        "expression_detected": False,
+        "captured": False,
+        "action": None,
+        "landmarks": landmarks
+    }
+
+    if not face_present:
+        result["message"] = "No face detected"
+        return result
+
+    # Neutral: face roughly frontal (lenient thresholds for better detection)
+    if action_id in ["neutral", "final_neutral"]:
+        # Lenient thresholds: allow more head movement
+        frontal = abs(yaw) <= 20 and abs(pitch) <= 20
+        result["captured"] = frontal
+        result["message"] = "Face frontal" if frontal else f"Xoay đầu ít hơn (yaw: {yaw:.0f}°, pitch: {pitch:.0f}°)"
+        if frontal:
+            result["action"] = action_id
+        return result
+
+    # Blink
+    if action_id == "blink":
+        if landmarks is None:
+            result["message"] = "Không đủ landmarks để phát hiện chớp mắt"
+            return result
+        expr = bool(detect_blink_expression(np.array(landmarks, dtype=np.float32)))
+        result["expression_detected"] = expr
+        result["captured"] = expr
+        result["action"] = action_id if expr else None
+        result["message"] = "Blink detected" if expr else "Chưa chớp mắt"
+        return result
+
+    # Mouth open
+    if action_id == "mouth_open":
+        if landmarks is None:
+            result["message"] = "Không đủ landmarks để phát hiện mở miệng"
+            return result
+        expr = bool(detect_mouth_open_expression(np.array(landmarks, dtype=np.float32)))
+        result["expression_detected"] = expr
+        result["captured"] = expr
+        result["action"] = action_id if expr else None
+        result["message"] = "Mouth open detected" if expr else "Miệng chưa mở"
+        return result
+    # Micro movement (nhúc nhích nhẹ) - detect small head movement (lenient)
+    if action_id == "micro_movement":
+        # More lenient: any visible movement counts
+        moved = abs(yaw) >= 2 or abs(pitch) >= 2 or abs(roll) >= 2
+        result["expression_detected"] = moved
+        result["captured"] = moved
+        result["action"] = action_id if moved else None
+        result["message"] = "Micro movement detected" if moved else "Hãy nhúc nhích đầu nhẹ"
+        return result
+
+    # Smile (if used)
+    if action_id == "smile":
+        if landmarks is None:
+            result["message"] = "Không đủ landmarks để phát hiện cười"
+            return result
+        expr = bool(detect_smile_expression(np.array(landmarks, dtype=np.float32)))
+        result["expression_detected"] = expr
+        result["captured"] = expr
+        result["action"] = action_id if expr else None
+        result["message"] = "Smile detected" if expr else "Chưa mỉm cười"
+        return result
+
+    # Fallback: unknown action
+    result["message"] = f"Unknown action: {action_id}"
+    return result

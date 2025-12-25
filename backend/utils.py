@@ -20,18 +20,24 @@ def check_image_quality(img: np.ndarray) -> Tuple[bool, str]:
         # Check blur using Laplacian variance
         blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
 
-        logger.debug(f"Image quality - Brightness: {brightness:.1f}, Blur: {blur_score:.1f}")
+        logger.info(f"🔍 Image quality - Brightness: {brightness:.1f}, Blur: {blur_score:.2f}")
 
         # Quality thresholds (calibrated for mobile cameras)
         if brightness < 40:
+            logger.warning(f"❌ Too dark: brightness {brightness:.1f} < 40")
             return False, "Ảnh quá tối, hãy di chuyển ra nơi sáng hơn"
 
         if brightness > 240:
+            logger.warning(f"❌ Too bright: brightness {brightness:.1f} > 240")
             return False, "Ảnh quá sáng, hãy tránh ánh sáng trực tiếp"
 
-        if blur_score < 80:
+        # Very lenient blur threshold for mobile cameras (reduced to 5)
+        # Mobile cameras often have blur scores 5-50
+        if blur_score < 5:
+            logger.warning(f"❌ Too blurry: blur_score {blur_score:.2f} < 5")
             return False, "Ảnh bị mờ, hãy giữ yên camera và tập trung vào khuôn mặt"
 
+        logger.info(f"✅ Image quality OK - Brightness: {brightness:.1f}, Blur: {blur_score:.2f}")
         return True, "Ảnh chất lượng tốt"
 
     except Exception as e:

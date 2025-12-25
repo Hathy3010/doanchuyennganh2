@@ -48,7 +48,8 @@ class UserCreate(BaseModel):
     email: str
     password: str
     full_name: str
-    role: str = Field(default="student", regex="^(student|teacher)$")
+    role: str = Field(default="student", pattern="^(student|teacher)$")
+
 
 class UserLogin(BaseModel):
     username: str
@@ -63,7 +64,7 @@ class AttendanceRecord(BaseModel):
     class_id: str
     date: str
     check_in_time: datetime
-    status: str = Field(default="present", regex="^(present|late|absent)$")
+    status: str = Field(default="present", pattern="^(present|late|absent)$")
     verification_method: str
     validations: dict
     warnings: List[str] = []

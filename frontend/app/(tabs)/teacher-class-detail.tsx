@@ -145,6 +145,7 @@ export default function TeacherClassDetailScreen() {
                 <View style={styles.studentInfo}>
                   <Text style={styles.studentName}>{student.full_name}</Text>
                   <Text style={styles.studentId}>{student.student_id}</Text>
+                  <Text style={styles.lastEdited}>Chỉnh sửa lần cuối: {new Date().toLocaleDateString()}</Text>
                 </View>
 
                 <View style={styles.attendanceStatus}>
