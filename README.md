@@ -9,7 +9,7 @@ Hệ thống điểm danh thông minh sử dụng nhận dạng khuôn mặt và
 - **FastAPI** - Web framework
 - **OpenCV** - Computer vision cho face detection
 - **ONNX Runtime** - Model inference cho face recognition
-- **SQLite** - Database (stored in face_db/)
+- **MongoDB** - Database (stored in face_db/)
 
 ### Frontend
 - **React Native** với **Expo**
